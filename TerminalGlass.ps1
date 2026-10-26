@@ -1,8 +1,13 @@
 ﻿<#
 .SYNOPSIS
     TerminalGlass — 调节 Windows Terminal 的磨砂/透明外观，并可精确还原。
+    TerminalGlass — Windows Terminal acrylic appearance tool with precise restore.
 
 .DESCRIPTION
+    Only edits two appearance keys under profiles.defaults in settings.json.
+    No drivers, no DWM hooks, no registry writes, no admin rights.
+    The first Apply records the original values; Reset puts them back exactly.
+
     只改写 settings.json 中 profiles.defaults 下的两个外观键：
         opacity      0-100     窗口透过率（越低越"透"）
         useAcrylic   true/false 是否启用 Windows 亚克力模糊
@@ -41,6 +46,7 @@ param(
     [int]$Opacity = -1,
     [bool]$Acrylic = $true,
     [switch]$DisableAcrylic,
+    [string]$Language = 'auto',
     [string]$SettingsPath = '',
     [string]$StateDir = ''
 )
@@ -57,6 +63,289 @@ $script:StateDir = if ($StateDir) {
 $script:StateFile = Join-Path $script:StateDir 'state.json'
 $script:BackupDir = Join-Path $script:StateDir 'backups'
 
+# ---------------------------------------------------------------- 语言 / i18n
+
+$script:Lang = 'en'
+
+$script:Str = @{
+    zh = @{
+        # 错误
+        err_no_settings           = '没有找到 Windows Terminal 的 settings.json。请确认已安装 Windows Terminal，或用 -SettingsPath 指定。'
+        err_json_string_pos       = 'JSON 解析失败：位置 {0} 处应为字符串'
+        err_json_unterminated     = 'JSON 解析失败：字符串没有闭合'
+        err_json_unbalanced       = 'JSON 解析失败：括号不匹配'
+        err_json_unexpected_end   = 'JSON 解析失败：意外的结尾'
+        err_json_missing_colon    = 'JSON 解析失败：键 {0} 后缺少冒号'
+        err_root_not_object       = 'settings.json 根节点不是对象，无法处理。'
+        err_no_profiles           = 'settings.json 里找不到 profiles 节点。'
+        err_legacy_profiles       = 'profiles 是旧版数组格式，本工具只支持新版对象格式（profiles.defaults）。'
+        err_defaults_not_object   = 'profiles.defaults 不是对象，无法安全修改。'
+        err_write_failed          = '写入 settings.json 失败（可能正被 Terminal 占用）：{0}'
+        err_opacity_range         = '不透明度必须在 0-100 之间。'
+        err_apply_selfcheck       = "写入后的自检未通过，已自动回滚到操作前快照。`n期望：opacity={0}，useAcrylic={1}`n实际：opacity={2}（{3}），useAcrylic={4}（{5}）`n回滚快照：{6}"
+        err_restore_selfcheck     = '还原后的自检未通过（{0}），已自动回滚到还原前快照：{1}'
+        state_incomplete          = '还原记录结构不完整'
+        warn_state_corrupt        = '还原记录已损坏，已另存为 {0}；本次会重新记录当前值。'
+        err_busy                  = '另一个 TerminalGlass 实例正在写入，请稍后再试。'
+        err_new_invalid           = '生成的新配置无法通过 JSON 校验，已放弃写入。原文件备份：{0}'
+        err_no_state              = "没有找到本工具的还原记录（{0}）。`n如果配置被改坏，可以从备份目录手工恢复：{1}"
+        err_path_mismatch         = "还原记录对应的是：`n{0}`n当前目标却是：`n{1}`n为避免误改，已停止。请用 -SettingsPath 指定正确文件。"
+        err_restore_invalid       = '还原后的配置无法通过 JSON 校验，已放弃写入。原文件备份：{0}'
+        err_sta                   = '图形界面需要在 STA 线程下运行。请用 Launch.cmd 启动，或改用 powershell.exe（Windows PowerShell 5.1），不要用 pwsh。'
+        err_repair_state          = '存在还原记录（{0}）。请先执行 -Reset 回到基线，再运行 -Repair。'
+        err_repair_invalid        = '修复后的配置无法通过 JSON 校验，已放弃写入。原文件备份：{0}'
+        err_repair_selfcheck      = '修复自检未通过，已回滚。快照：{0}'
+
+        restore_problem_opacity   = 'opacity 期望 {0}，实际 {1}'
+        restore_problem_acrylic   = 'useAcrylic 期望 {0}，实际 {1}'
+        restore_problem_absent_opacity = 'opacity 期望不存在，实际存在'
+        restore_problem_absent_acrylic = 'useAcrylic 期望不存在，实际存在'
+
+        present_s                 = '存在'
+        missing_s                 = '缺失'
+
+        # 状态
+        status_title              = 'TerminalGlass 状态'
+        status_path               = '  配置文件   : {0}'
+        status_opacity            = '  当前不透明度: {0}%'
+        status_acrylic            = '  当前亚克力  : {0}'
+        status_defaults           = '  profiles.defaults: {0}'
+        status_state              = '  还原记录   : {0}'
+        status_terminal           = '  Terminal  : {0}'
+        status_backup             = '  备份目录   : {0}'
+        on                        = '开启'
+        off                       = '关闭'
+        exists                    = '存在'
+        absent_will_create        = '不存在（应用时会创建）'
+        state_yes                 = '有（创建于 {0}）'
+        state_no                  = '无'
+        term_running              = '正在运行（改完立即热重载）'
+        term_stopped              = '未运行（下次启动生效）'
+
+        # 自检
+        verify_title              = 'TerminalGlass 自检'
+        verify_opacity_line       = '  opacity    : {0} {1}'
+        verify_acrylic_line       = '  useAcrylic : {0} {1}'
+        verify_explicit           = '（文件里显式存在）'
+        verify_absent_100         = '（文件里不存在，取内置默认 100）'
+        verify_absent_false       = '（文件里不存在，取内置默认 false）'
+        verify_hint               = '  提示       : opacity=100 且 useAcrylic=false 是"显式写出的默认值"，行为与不存在完全等价。'
+        verify_state_none         = '  还原记录   : 无'
+        verify_verdict_baseline   = '  判定       : 当前外观就是基线，本工具没有留下可还原的改动。'
+        verify_state_yes          = '  还原记录   : 有'
+        verify_recorded_absent    = '（原本不存在）'
+        verify_record_line        = '    记录 {0} : {1}'
+        verify_verdict_same       = '  判定       : 与记录一致，当前处于"未应用 / 已还原"状态。'
+        verify_verdict_diff       = '  判定       : 与记录不同，当前是应用后的外观；可点"还原"回到基线。'
+
+        # 命令输出
+        repaired                  = '已清理显式默认值（opacity=100 / useAcrylic=false）。'
+        repair_none               = '没有需要清理的显式默认值。'
+        applied                   = '已应用：不透明度 {0}%，亚克力 {1}'
+        restored                  = '已还原到使用本工具之前的外观。'
+        backup_line               = '备份：{0}'
+        snapshot_before           = '还原前快照：{0}'
+        error_prefix              = '错误：{0}'
+        error_title               = 'TerminalGlass 出错'
+
+        # 图形界面
+        win_title                 = 'Terminal 外观'
+        header_title              = 'Terminal 外观'
+        header_sub                = '只修改 settings.json 的两个外观键，随时可以还原'
+        acrylic_title             = '亚克力模糊'
+        acrylic_desc              = 'Windows 的 Acrylic 材质，实时模糊窗口背后的内容'
+        strength                  = '磨砂强度'
+        preset_light              = '轻 90%'
+        preset_medium             = '中 80%'
+        preset_heavy              = '重 65%'
+        preset_clear              = '全透 40%'
+        gui_hint                  = '数值越低越透。模糊半径由 Windows 固定，这里调的是透过率。'
+        btn_apply                 = '应用'
+        btn_reset                 = '还原'
+        btn_close                 = '关闭'
+        gui_status_path           = '配置文件  {0}'
+        gui_status_look           = '当前外观  不透明度 {0}%   亚克力 {1}'
+        gui_status_record         = '还原记录  {0}'
+        gui_record_yes            = '有，可还原到使用本工具之前'
+        gui_record_no             = '无'
+        gui_status_term           = 'Terminal  {0}'
+        gui_term_running          = '运行中，应用后立即生效'
+        gui_term_stopped          = '未运行，下次启动生效'
+        gui_status_backup         = '备份目录  {0}'
+        gui_applied               = '已应用：不透明度 {0}%，亚克力{1}。Terminal 会自动热重载。'
+        gui_reset_done            = '已还原到使用本工具之前的外观。'
+        gui_apply_failed          = '应用失败：{0}'
+        gui_reset_failed          = '还原失败：{0}'
+    }
+
+    en = @{
+        # errors
+        err_no_settings           = 'Windows Terminal settings.json was not found. Install Windows Terminal, or pass -SettingsPath.'
+        err_json_string_pos       = 'JSON parse error: expected a string at position {0}'
+        err_json_unterminated     = 'JSON parse error: unterminated string'
+        err_json_unbalanced       = 'JSON parse error: unbalanced brackets'
+        err_json_unexpected_end   = 'JSON parse error: unexpected end of input'
+        err_json_missing_colon    = 'JSON parse error: missing colon after key {0}'
+        err_root_not_object       = 'The settings.json root is not an object.'
+        err_no_profiles           = 'No "profiles" node found in settings.json.'
+        err_legacy_profiles       = 'profiles uses the legacy array format. Only the object format (profiles.defaults) is supported.'
+        err_defaults_not_object   = 'profiles.defaults is not an object; refusing to modify it.'
+        err_write_failed          = 'Failed to write settings.json (it may be locked by Windows Terminal): {0}'
+        err_opacity_range         = 'Opacity must be between 0 and 100.'
+        err_apply_selfcheck       = "Post-write check failed; rolled back to the pre-change snapshot.`nExpected: opacity={0}, useAcrylic={1}`nActual: opacity={2} ({3}), useAcrylic={4} ({5})`nSnapshot: {6}"
+        err_restore_selfcheck     = 'Post-restore check failed ({0}); rolled back to the snapshot taken before the restore: {1}'
+        state_incomplete          = 'The restore record is incomplete'
+        warn_state_corrupt        = 'The restore record was corrupted and has been saved as {0}; current values will be recorded again.'
+        err_busy                  = 'Another TerminalGlass instance is writing. Try again shortly.'
+        err_new_invalid           = 'The generated settings failed JSON validation; nothing was written. Backup: {0}'
+        err_no_state              = "No restore record found ({0}).`nIf the config was damaged, restore manually from: {1}"
+        err_path_mismatch         = "The restore record belongs to:`n{0}`nbut the current target is:`n{1}`nStopped to avoid modifying the wrong file. Use -SettingsPath to point at the right one."
+        err_restore_invalid       = 'The restored settings failed JSON validation; nothing was written. Backup: {0}'
+        err_sta                   = 'The GUI must run on an STA thread. Start it with Launch.cmd, or use powershell.exe (Windows PowerShell 5.1) instead of pwsh.'
+        err_repair_state          = 'A restore record exists ({0}). Run -Reset first, then -Repair.'
+        err_repair_invalid        = 'The repaired settings failed JSON validation; nothing was written. Backup: {0}'
+        err_repair_selfcheck      = 'Repair self-check failed; rolled back. Snapshot: {0}'
+
+        restore_problem_opacity   = 'opacity expected {0}, got {1}'
+        restore_problem_acrylic   = 'useAcrylic expected {0}, got {1}'
+        restore_problem_absent_opacity = 'opacity was expected to be absent but is present'
+        restore_problem_absent_acrylic = 'useAcrylic was expected to be absent but is present'
+
+        present_s                 = 'present'
+        missing_s                 = 'missing'
+
+        # status
+        status_title              = 'TerminalGlass status'
+        status_path               = '  Settings file  : {0}'
+        status_opacity            = '  Opacity        : {0}%'
+        status_acrylic            = '  Acrylic        : {0}'
+        status_defaults           = '  profiles.defaults: {0}'
+        status_state              = '  Restore record : {0}'
+        status_terminal           = '  Terminal       : {0}'
+        status_backup             = '  Backups        : {0}'
+        on                        = 'on'
+        off                       = 'off'
+        exists                    = 'present'
+        absent_will_create        = 'absent (created on apply)'
+        state_yes                 = 'yes (created {0})'
+        state_no                  = 'none'
+        term_running              = 'running (hot reload)'
+        term_stopped              = 'not running (applies next launch)'
+
+        # verify
+        verify_title              = 'TerminalGlass self-check'
+        verify_opacity_line       = '  opacity    : {0} {1}'
+        verify_acrylic_line       = '  useAcrylic : {0} {1}'
+        verify_explicit           = '(explicitly present in the file)'
+        verify_absent_100         = '(absent from the file; built-in default 100)'
+        verify_absent_false       = '(absent from the file; built-in default false)'
+        verify_hint               = '  Note       : opacity=100 with useAcrylic=false is an explicitly written default; behavior is identical to absent.'
+        verify_state_none         = '  Restore record : none'
+        verify_verdict_baseline   = '  Verdict    : this is the baseline; the tool left no changes to undo.'
+        verify_state_yes          = '  Restore record : yes'
+        verify_recorded_absent    = '(was absent)'
+        verify_record_line        = '    recorded {0} : {1}'
+        verify_verdict_same       = '  Verdict    : matches the record (not applied / already restored).'
+        verify_verdict_diff       = '  Verdict    : differs from the record (skin applied); use Reset to return to baseline.'
+
+        # command output
+        repaired                  = 'Removed the explicitly written defaults (opacity=100 / useAcrylic=false).'
+        repair_none               = 'Nothing to repair.'
+        applied                   = 'Applied: opacity {0}%, acrylic {1}'
+        restored                  = 'Restored to the appearance before this tool was used.'
+        backup_line               = 'Backup: {0}'
+        snapshot_before           = 'Snapshot before restore: {0}'
+        error_prefix              = 'Error: {0}'
+        error_title               = 'TerminalGlass error'
+
+        # GUI
+        win_title                 = 'Terminal Appearance'
+        header_title              = 'Terminal Appearance'
+        header_sub                = 'Edits two appearance keys in settings.json; fully reversible'
+        acrylic_title             = 'Acrylic blur'
+        acrylic_desc              = 'Windows Acrylic material blurs whatever is behind the window'
+        strength                  = 'Frost strength'
+        preset_light              = 'Light 90%'
+        preset_medium             = 'Medium 80%'
+        preset_heavy              = 'Heavy 65%'
+        preset_clear              = 'Clear 40%'
+        gui_hint                  = 'Lower means more transparent. The blur radius is fixed by Windows; this controls transparency.'
+        btn_apply                 = 'Apply'
+        btn_reset                 = 'Reset'
+        btn_close                 = 'Close'
+        gui_status_path           = 'Settings file  {0}'
+        gui_status_look           = 'Current  opacity {0}%   acrylic {1}'
+        gui_status_record         = 'Record  {0}'
+        gui_record_yes            = 'yes, can restore to before this tool'
+        gui_record_no             = 'none'
+        gui_status_term           = 'Terminal  {0}'
+        gui_term_running          = 'running, applies immediately'
+        gui_term_stopped          = 'not running, applies next launch'
+        gui_status_backup         = 'Backups  {0}'
+        gui_applied               = 'Applied: opacity {0}%, acrylic {1}. Terminal hot-reloads automatically.'
+        gui_reset_done            = 'Restored to the appearance before this tool was used.'
+        gui_apply_failed          = 'Apply failed: {0}'
+        gui_reset_failed          = 'Reset failed: {0}'
+    }
+}
+
+function T {
+    param([string]$Key)
+    $table = $script:Str[$script:Lang]
+    if ($table -and $table.ContainsKey($Key)) { return [string]$table[$Key] }
+    return [string]$script:Str['en'][$Key]
+}
+
+function Tf {
+    param([string]$Key, [object[]]$Arguments)
+    $fmt = T $Key
+    try { return ([string]::Format($fmt, $Arguments)) } catch { return $fmt }
+}
+
+function Resolve-UiLanguage {
+    param([string]$Requested)
+
+    $lang = ''
+    if ($Requested -and $Requested -ne 'auto') { $lang = $Requested.ToLowerInvariant() }
+
+    if (-not $lang) {
+        $prefs = Join-Path $script:StateDir 'prefs.json'
+        if (Test-Path -LiteralPath $prefs) {
+            try {
+                $p = Get-Content -LiteralPath $prefs -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($p -and $p.lang) { $lang = [string]$p.lang }
+            }
+            catch { }
+        }
+    }
+
+    if (-not $lang) {
+        $lang = if ([System.Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'zh') { 'zh' } else { 'en' }
+    }
+    if ($lang -ne 'zh' -and $lang -ne 'en') { $lang = 'en' }
+    return $lang
+}
+
+function Switch-UiLanguage {
+    $script:Lang = if ($script:Lang -eq 'zh') { 'en' } else { 'zh' }
+    Save-UiLanguage -Lang $script:Lang
+    return $script:Lang
+}
+
+function Save-UiLanguage {
+    param([string]$Lang)
+    try {
+        if (-not (Test-Path -LiteralPath $script:StateDir)) {
+            New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
+        }
+        [pscustomobject]@{ lang = $Lang } | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $script:StateDir 'prefs.json') -Encoding UTF8
+    }
+    catch { }
+}
+
+$script:Lang = Resolve-UiLanguage $Language
+
 function Find-SettingsPath {
     $candidates = @(
         (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'),
@@ -66,7 +355,7 @@ function Find-SettingsPath {
     foreach ($p in $candidates) {
         if (Test-Path -LiteralPath $p) { return $p }
     }
-    throw '没有找到 Windows Terminal 的 settings.json。请确认已安装 Windows Terminal，或用 -SettingsPath 指定。'
+    throw (T 'err_no_settings')
 }
 
 # ---------------------------------------------------------------- JSON 扫描
@@ -99,7 +388,7 @@ function Skip-Trivia {
 
 function Get-StringEnd {
     param([string]$S, [int]$I)
-    if ($I -ge $S.Length -or $S[$I] -ne '"') { throw "JSON 解析失败：$I 处应为字符串" }
+    if ($I -ge $S.Length -or $S[$I] -ne '"') { throw (Tf 'err_json_string_pos' @($I)) }
     $I++
     while ($I -lt $S.Length) {
         $c = $S[$I]
@@ -107,7 +396,7 @@ function Get-StringEnd {
         if ($c -eq '"') { return $I + 1 }
         $I++
     }
-    throw 'JSON 解析失败：字符串没有闭合'
+    throw (T 'err_json_unterminated')
 }
 
 function Get-ContainerEnd {
@@ -129,13 +418,13 @@ function Get-ContainerEnd {
         }
         $I++
     }
-    throw 'JSON 解析失败：括号不匹配'
+    throw (T 'err_json_unbalanced')
 }
 
 function Skip-Value {
     param([string]$S, [int]$I)
     $I = Skip-Trivia $S $I
-    if ($I -ge $S.Length) { throw 'JSON 解析失败：意外的结尾' }
+    if ($I -ge $S.Length) { throw (T 'err_json_unexpected_end') }
     $c = $S[$I]
     if ($c -eq '{' -or $c -eq '[') { return Get-ContainerEnd $S $I }
     if ($c -eq '"') { return Get-StringEnd $S $I }
@@ -162,7 +451,7 @@ function Find-ObjectMember {
         $rawKey = $S.Substring($keyStart, $keyEnd - $keyStart)
         $name = $rawKey.Substring(1, $rawKey.Length - 2)
         $I = Skip-Trivia $S $keyEnd
-        if ($I -ge $S.Length -or $S[$I] -ne ':') { throw "JSON 解析失败：键 $name 后缺少冒号" }
+        if ($I -ge $S.Length -or $S[$I] -ne ':') { throw (Tf 'err_json_missing_colon' @($name)) }
         $I = Skip-Trivia $S ($I + 1)
         $valueStart = $I
         $valueEnd = Skip-Value $S $I
@@ -183,16 +472,16 @@ function Get-DefaultsInfo {
     param([string]$Text)
     $root = Skip-Trivia $Text 0
     if ($root -ge $Text.Length -or $Text[$root] -ne '{') {
-        throw 'settings.json 根节点不是对象，无法处理。'
+        throw (T 'err_root_not_object')
     }
     $profiles = Find-ObjectMember $Text $root 'profiles'
-    if (-not $profiles) { throw 'settings.json 里找不到 profiles 节点。' }
+    if (-not $profiles) { throw (T 'err_no_profiles') }
     if ($Text[$profiles.ValueStart] -ne '{') {
-        throw 'profiles 是旧版数组格式，本工具只支持新版对象格式（profiles.defaults）。'
+        throw (T 'err_legacy_profiles')
     }
     $defaults = Find-ObjectMember $Text $profiles.ValueStart 'defaults'
     if ($defaults -and $Text[$defaults.ValueStart] -ne '{') {
-        throw 'profiles.defaults 不是对象，无法安全修改。'
+        throw (T 'err_defaults_not_object')
     }
     return [pscustomobject]@{ Profiles = $profiles; Defaults = $defaults }
 }
@@ -423,7 +712,7 @@ function Save-SettingsFile {
         }
     }
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-    throw "写入 settings.json 失败（可能正被 Terminal 占用）：$($last.Exception.Message)"
+    throw (Tf 'err_write_failed' @($last.Exception.Message))
 }
 
 function Backup-SettingsFile {
@@ -480,12 +769,11 @@ function Assert-SkinApplied {
         return
     }
     Copy-Item -LiteralPath $Backup -Destination $Path -Force
-    throw @"
-写入后的自检未通过，已自动回滚到操作前快照。
-期望：opacity=$Opacity，useAcrylic=$Acrylic
-实际：opacity=$($check.Opacity)（$(if ($check.HasOpacity) { '存在' } else { '缺失' })），useAcrylic=$($check.UseAcrylic)（$(if ($check.HasAcrylic) { '存在' } else { '缺失' })）
-回滚快照：$Backup
-"@
+    $pText = T 'present_s'
+    $mText = T 'missing_s'
+    $hasOpacityText = if ($check.HasOpacity) { $pText } else { $mText }
+    $hasAcrylicText = if ($check.HasAcrylic) { $pText } else { $mText }
+    throw (Tf 'err_apply_selfcheck' @($Opacity, $Acrylic, $check.Opacity, $hasOpacityText, $check.UseAcrylic, $hasAcrylicText, $Backup))
 }
 
 function Assert-SkinRestored {
@@ -503,28 +791,28 @@ function Assert-SkinRestored {
                 $want = 0
                 if (-not [int]::TryParse([string]$rec.value, [ref]$want)) { continue }
                 if (-not $check.HasOpacity -or [int]$check.Opacity -ne $want) {
-                    $problem = "opacity 期望 $want，实际 $(if ($check.HasOpacity) { $check.Opacity } else { '缺失' })"
+                    $problem = Tf 'restore_problem_opacity' @($want, $(if ($check.HasOpacity) { $check.Opacity } else { (T 'missing_s') }))
                 }
             }
             elseif ($check.HasOpacity) {
-                $problem = 'opacity 期望不存在，实际存在'
+                $problem = T 'restore_problem_absent_opacity'
             }
         }
         elseif ($name -eq 'useAcrylic') {
             if ($rec.present) {
                 if (-not $check.HasAcrylic -or [bool]$check.UseAcrylic -ne [bool]$rec.value) {
-                    $problem = "useAcrylic 期望 $($rec.value)，实际 $(if ($check.HasAcrylic) { $check.UseAcrylic } else { '缺失' })"
+                    $problem = Tf 'restore_problem_acrylic' @($rec.value, $(if ($check.HasAcrylic) { $check.UseAcrylic } else { (T 'missing_s') }))
                 }
             }
             elseif ($check.HasAcrylic) {
-                $problem = 'useAcrylic 期望不存在，实际存在'
+                $problem = T 'restore_problem_absent_acrylic'
             }
         }
     }
 
     if ($problem) {
         Copy-Item -LiteralPath $Backup -Destination $Path -Force
-        throw "还原后的自检未通过（$problem），已自动回滚到还原前快照：$Backup"
+        throw (Tf 'err_restore_selfcheck' @($problem, $Backup))
     }
 }
 
@@ -532,13 +820,13 @@ function Read-State {
     if (-not (Test-Path -LiteralPath $script:StateFile)) { return $null }
     try {
         $s = Get-Content -LiteralPath $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $s -or -not $s.settingsPath -or -not $s.keys) { throw '结构不完整' }
+        if (-not $s -or -not $s.settingsPath -or -not $s.keys) { throw (T 'state_incomplete') }
         return $s
     }
     catch {
         $bad = "$script:StateFile.corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         try { Move-Item -LiteralPath $script:StateFile -Destination $bad -Force } catch { }
-        Write-Warning "还原记录已损坏，已另存为 $bad；本次会重新记录当前值。"
+        Write-Warning (Tf 'warn_state_corrupt' @($bad))
         return $null
     }
 }
@@ -550,7 +838,7 @@ function Invoke-WithLock {
     $acquired = $mutex.WaitOne(3000)
     if (-not $acquired) {
         $mutex.Dispose()
-        throw '另一个 TerminalGlass 实例正在写入，请稍后再试。'
+        throw (T 'err_busy')
     }
     try {
         return (& $Action)
@@ -579,7 +867,7 @@ function Save-State {
 function Set-Skin {
     param([string]$Path, [int]$Opacity, [bool]$Acrylic)
 
-    if ($Opacity -lt 0 -or $Opacity -gt 100) { throw '不透明度必须在 0-100 之间。' }
+    if ($Opacity -lt 0 -or $Opacity -gt 100) { throw (T 'err_opacity_range') }
 
     $current = Get-CurrentSkin -Path $Path
     $text = $current.Text
@@ -610,7 +898,7 @@ function Set-Skin {
     $newText = Write-DefaultsObject -Text $text -Info $info -Obj $obj
 
     if (-not (Test-JsonC $newText)) {
-        throw "生成的新配置无法通过 JSON 校验，已放弃写入。原文件备份：$backup"
+        throw (Tf 'err_new_invalid' @($backup))
     }
 
     if ($newText -ceq $text) {
@@ -633,10 +921,10 @@ function Undo-Skin {
 
     $state = Read-State
     if (-not $state) {
-        throw "没有找到本工具的还原记录（$script:StateFile）。`n如果配置被改坏，可以从备份目录手工恢复：$script:BackupDir"
+        throw (Tf 'err_no_state' @($script:StateFile, $script:BackupDir))
     }
     if ($state.settingsPath -ne $Path) {
-        throw "还原记录对应的是：`n$($state.settingsPath)`n当前目标却是：`n$Path`n为避免误改，已停止。请用 -SettingsPath 指定正确文件。"
+        throw (Tf 'err_path_mismatch' @($state.settingsPath, $Path))
     }
 
     $current = Get-CurrentSkin -Path $Path
@@ -669,7 +957,7 @@ function Undo-Skin {
 
     $newText = Write-DefaultsObject -Text $text -Info $info -Obj $obj
     if (-not (Test-JsonC $newText)) {
-        throw "还原后的配置无法通过 JSON 校验，已放弃写入。原文件备份：$backup"
+        throw (Tf 'err_restore_invalid' @($backup))
     }
 
     if ($newText -cne $text) {
@@ -690,16 +978,21 @@ function Show-Status {
     $cur = Get-CurrentSkin -Path $path
     $state = Read-State
 
+    $acrylicText = if ($cur.UseAcrylic) { T 'on' } else { T 'off' }
+    $defaultsText = if ($cur.HasDefaults) { T 'exists' } else { T 'absent_will_create' }
+    $stateText = if ($state) { Tf 'state_yes' @($state.createdUtc) } else { T 'state_no' }
+    $termText = if (Get-TerminalRunning) { T 'term_running' } else { T 'term_stopped' }
+
     Write-Host ''
-    Write-Host '  TerminalGlass 状态' -ForegroundColor Cyan
+    Write-Host ('  ' + (T 'status_title')) -ForegroundColor Cyan
     Write-Host '  ------------------------------------------'
-    Write-Host "  配置文件   : $path"
-    Write-Host "  当前不透明度: $($cur.Opacity)%"
-    Write-Host "  当前亚克力  : $(if ($cur.UseAcrylic) { '开启' } else { '关闭' })"
-    Write-Host "  profiles.defaults: $(if ($cur.HasDefaults) { '存在' } else { '不存在（应用时会创建）' })"
-    Write-Host "  还原记录   : $(if ($state) { "有（创建于 $($state.createdUtc)）" } else { '无' })"
-    Write-Host "  Terminal  : $(if (Get-TerminalRunning) { '正在运行（改完立即热重载）' } else { '未运行（下次启动生效）' })"
-    Write-Host "  备份目录   : $script:BackupDir"
+    Write-Host (Tf 'status_path' @($path))
+    Write-Host (Tf 'status_opacity' @($cur.Opacity))
+    Write-Host (Tf 'status_acrylic' @($acrylicText))
+    Write-Host (Tf 'status_defaults' @($defaultsText))
+    Write-Host (Tf 'status_state' @($stateText))
+    Write-Host (Tf 'status_terminal' @($termText))
+    Write-Host (Tf 'status_backup' @($script:BackupDir))
     Write-Host ''
 }
 
@@ -710,7 +1003,7 @@ function Repair-Defaults {
 
     $state = Read-State
     if ($state) {
-        throw "存在还原记录（$script:StateFile）。请先执行 -Reset 回到基线，再运行 -Repair。"
+        throw (Tf 'err_repair_state' @($script:StateFile))
     }
 
     $cur = Get-CurrentSkin -Path $Path
@@ -736,14 +1029,14 @@ function Repair-Defaults {
 
     $newText = Write-DefaultsObject -Text $cur.Text -Info $cur.Info -Obj $obj
     if (-not (Test-JsonC $newText)) {
-        throw "修复后的配置无法通过 JSON 校验，已放弃写入。原文件备份：$backup"
+        throw (Tf 'err_repair_invalid' @($backup))
     }
     Save-SettingsFile -Path $Path -Text $newText
 
     $check = Get-CurrentSkin -Path $Path
     if ($check.HasOpacity -or $check.HasAcrylic) {
         Copy-Item -LiteralPath $backup -Destination $Path -Force
-        throw "修复自检未通过，已回滚。快照：$backup"
+        throw (Tf 'err_repair_selfcheck' @($backup))
     }
 
     return [pscustomobject]@{ Changed = $true; Backup = $backup }
@@ -754,20 +1047,23 @@ function Show-Verify {
     $cur = Get-CurrentSkin -Path $path
     $state = Read-State
 
+    $opacityNote = if ($cur.HasOpacity) { T 'verify_explicit' } else { T 'verify_absent_100' }
+    $acrylicNote = if ($cur.HasAcrylic) { T 'verify_explicit' } else { T 'verify_absent_false' }
+
     Write-Host ''
-    Write-Host '  TerminalGlass 自检' -ForegroundColor Cyan
+    Write-Host ('  ' + (T 'verify_title')) -ForegroundColor Cyan
     Write-Host '  ------------------------------------------'
-    Write-Host "  配置文件   : $path"
-    Write-Host "  opacity    : $($cur.Opacity) $(if ($cur.HasOpacity) { '（文件里显式存在）' } else { '（文件里不存在，取内置默认 100）' })"
-    Write-Host "  useAcrylic : $($cur.UseAcrylic) $(if ($cur.HasAcrylic) { '（文件里显式存在）' } else { '（文件里不存在，取内置默认 false）' })"
+    Write-Host (Tf 'status_path' @($path))
+    Write-Host (Tf 'verify_opacity_line' @($cur.Opacity, $opacityNote))
+    Write-Host (Tf 'verify_acrylic_line' @($cur.UseAcrylic, $acrylicNote))
 
     if ($cur.HasOpacity -and $cur.HasAcrylic -and $cur.Opacity -eq 100 -and -not $cur.UseAcrylic) {
-        Write-Host '  提示       : opacity=100 且 useAcrylic=false 是"显式写出的默认值"，行为与不存在完全等价。' -ForegroundColor DarkGray
+        Write-Host (T 'verify_hint') -ForegroundColor DarkGray
     }
 
     if (-not $state) {
-        Write-Host '  还原记录   : 无'
-        Write-Host '  判定       : 当前外观就是基线，本工具没有留下可还原的改动。' -ForegroundColor Green
+        Write-Host (T 'verify_state_none')
+        Write-Host (T 'verify_verdict_baseline') -ForegroundColor Green
     }
     else {
         $same = $true
@@ -791,21 +1087,21 @@ function Show-Verify {
             }
         }
 
-        Write-Host '  还原记录   : 有'
+        Write-Host (T 'verify_state_yes')
         foreach ($prop in $state.keys.PSObject.Properties) {
             if ($prop.Name -eq 'opacity' -or $prop.Name -eq 'useAcrylic') {
-                $desc = if ($prop.Value.present) { [string]$prop.Value.value } else { '（原本不存在）' }
-                Write-Host "    记录 $($prop.Name) : $desc"
+                $desc = if ($prop.Value.present) { [string]$prop.Value.value } else { (T 'verify_recorded_absent') }
+                Write-Host (Tf 'verify_record_line' @($prop.Name, $desc))
             }
         }
         if ($same) {
-            Write-Host '  判定       : 与记录一致，当前处于"未应用 / 已还原"状态。' -ForegroundColor Green
+            Write-Host (T 'verify_verdict_same') -ForegroundColor Green
         }
         else {
-            Write-Host '  判定       : 与记录不同，当前是应用后的外观；可点"还原"回到基线。' -ForegroundColor Yellow
+            Write-Host (T 'verify_verdict_diff') -ForegroundColor Yellow
         }
     }
-    Write-Host "  备份目录   : $script:BackupDir"
+    Write-Host (Tf 'status_backup' @($script:BackupDir))
     Write-Host ''
 }
 
@@ -821,22 +1117,44 @@ function Set-GuiMessage {
     catch { }
 }
 
+function Update-GuiText {
+    param($Win, [hashtable]$Ui)
+    $Win.Title = T 'win_title'
+    $Ui.HeaderTitle.Text = T 'header_title'
+    $Ui.HeaderSub.Text = T 'header_sub'
+    $Ui.AcrylicTitle.Text = T 'acrylic_title'
+    $Ui.AcrylicDesc.Text = T 'acrylic_desc'
+    $Ui.StrengthLabel.Text = T 'strength'
+    $Ui.P90.Content = T 'preset_light'
+    $Ui.P80.Content = T 'preset_medium'
+    $Ui.P65.Content = T 'preset_heavy'
+    $Ui.P40.Content = T 'preset_clear'
+    $Ui.HintText.Text = T 'gui_hint'
+    $Ui.ApplyButton.Content = T 'btn_apply'
+    $Ui.ResetButton.Content = T 'btn_reset'
+    $Ui.CloseButton.Content = T 'btn_close'
+    $Ui.LangButton.Content = if ($script:Lang -eq 'zh') { 'EN' } else { '中文' }
+}
+
 function Update-GuiStatus {
     param([string]$Path, $Block)
     $c = Get-CurrentSkin -Path $Path
     $s = Read-State
+    $acrylicText = if ($c.UseAcrylic) { T 'on' } else { T 'off' }
+    $recordText = if ($s) { T 'gui_record_yes' } else { T 'gui_record_no' }
+    $termText = if (Get-TerminalRunning) { T 'gui_term_running' } else { T 'gui_term_stopped' }
     $lines = @()
-    $lines += "配置文件  $Path"
-    $lines += "当前外观  不透明度 $($c.Opacity)%   亚克力 $(if ($c.UseAcrylic) { '开启' } else { '关闭' })"
-    $lines += "还原记录  $(if ($s) { '有，可还原到使用本工具之前' } else { '无' })"
-    $lines += "Terminal  $(if (Get-TerminalRunning) { '运行中，应用后立即生效' } else { '未运行，下次启动生效' })"
-    $lines += "备份目录  $($script:BackupDir)"
+    $lines += (Tf 'gui_status_path' @($Path))
+    $lines += (Tf 'gui_status_look' @($c.Opacity, $acrylicText))
+    $lines += (Tf 'gui_status_record' @($recordText))
+    $lines += (Tf 'gui_status_term' @($termText))
+    $lines += (Tf 'gui_status_backup' @($script:BackupDir))
     $Block.Text = ($lines -join "`r`n")
 }
 
 function Start-Gui {
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
-        throw '图形界面需要在 STA 线程下运行。请用 Launch.cmd 启动，或改用 powershell.exe（Windows PowerShell 5.1），不要用 pwsh。'
+        throw (T 'err_sta')
     }
 
     Add-Type -AssemblyName PresentationFramework
@@ -1053,10 +1371,17 @@ function Start-Gui {
       <RowDefinition Height="*"/>
     </Grid.RowDefinitions>
 
-    <StackPanel Grid.Row="0" Margin="2,0,0,18">
-      <TextBlock Text="Terminal 外观" FontSize="22" FontWeight="SemiBold" Foreground="#1B1B1B"/>
-      <TextBlock Text="只修改 settings.json 的两个外观键，随时可以还原" FontSize="12" Foreground="#8A8A8A" Margin="0,4,0,0"/>
-    </StackPanel>
+    <Grid Grid.Row="0" Margin="2,0,0,18">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0">
+        <TextBlock x:Name="HeaderTitle" Text="Terminal 外观" FontSize="22" FontWeight="SemiBold" Foreground="#1B1B1B"/>
+        <TextBlock x:Name="HeaderSub" Text="只修改 settings.json 的两个外观键，随时可以还原" FontSize="12" Foreground="#8A8A8A" Margin="0,4,0,0"/>
+      </StackPanel>
+      <Button x:Name="LangButton" Grid.Column="1" Content="EN" Style="{StaticResource Pill}" VerticalAlignment="Top" Margin="0,4,0,0" MinWidth="56"/>
+    </Grid>
 
     <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,0,12">
       <Grid>
@@ -1065,8 +1390,8 @@ function Start-Gui {
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel Grid.Column="0">
-          <TextBlock Text="亚克力模糊" FontSize="14" FontWeight="SemiBold" Foreground="#1F1F1F"/>
-          <TextBlock Text="Windows 的 Acrylic 材质，实时模糊窗口背后的内容" FontSize="12" Foreground="#8A8A8A" Margin="0,3,0,0" TextWrapping="Wrap"/>
+          <TextBlock x:Name="AcrylicTitle" Text="亚克力模糊" FontSize="14" FontWeight="SemiBold" Foreground="#1F1F1F"/>
+          <TextBlock x:Name="AcrylicDesc" Text="Windows 的 Acrylic 材质，实时模糊窗口背后的内容" FontSize="12" Foreground="#8A8A8A" Margin="0,3,0,0" TextWrapping="Wrap"/>
         </StackPanel>
         <CheckBox x:Name="AcrylicSwitch" Grid.Column="1" Style="{StaticResource Switch}" VerticalAlignment="Center"/>
       </Grid>
@@ -1075,7 +1400,7 @@ function Start-Gui {
     <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,0,0,12">
       <StackPanel>
         <Grid>
-          <TextBlock Text="磨砂强度" FontSize="14" FontWeight="SemiBold" Foreground="#1F1F1F" VerticalAlignment="Center"/>
+          <TextBlock x:Name="StrengthLabel" Text="磨砂强度" FontSize="14" FontWeight="SemiBold" Foreground="#1F1F1F" VerticalAlignment="Center"/>
           <TextBlock x:Name="ValueText" Text="85%" FontSize="20" FontWeight="SemiBold" Foreground="#0F6CBD" HorizontalAlignment="Right" VerticalAlignment="Center"/>
         </Grid>
         <Slider x:Name="OpacitySlider" Style="{StaticResource ModernSlider}" Minimum="0" Maximum="100"
@@ -1086,7 +1411,7 @@ function Start-Gui {
           <Button x:Name="P65" Content="重 65%" Style="{StaticResource Pill}" Margin="0,0,8,0"/>
           <Button x:Name="P40" Content="全透 40%" Style="{StaticResource Pill}"/>
         </StackPanel>
-        <TextBlock Text="数值越低越透。模糊半径由 Windows 固定，这里调的是透过率。" FontSize="11" Foreground="#8A8A8A" Margin="0,12,0,0" TextWrapping="Wrap"/>
+        <TextBlock x:Name="HintText" Text="数值越低越透。模糊半径由 Windows 固定，这里调的是透过率。" FontSize="11" Foreground="#8A8A8A" Margin="0,12,0,0" TextWrapping="Wrap"/>
       </StackPanel>
     </Border>
 
@@ -1118,6 +1443,32 @@ function Start-Gui {
     $applyBtn = $win.FindName('ApplyButton')
     $resetBtn = $win.FindName('ResetButton')
     $closeBtn = $win.FindName('CloseButton')
+    $langBtn = $win.FindName('LangButton')
+
+    $ui = @{
+        HeaderTitle   = $win.FindName('HeaderTitle')
+        HeaderSub     = $win.FindName('HeaderSub')
+        AcrylicTitle  = $win.FindName('AcrylicTitle')
+        AcrylicDesc   = $win.FindName('AcrylicDesc')
+        StrengthLabel = $win.FindName('StrengthLabel')
+        P90           = $win.FindName('P90')
+        P80           = $win.FindName('P80')
+        P65           = $win.FindName('P65')
+        P40           = $win.FindName('P40')
+        HintText      = $win.FindName('HintText')
+        ApplyButton   = $applyBtn
+        ResetButton   = $resetBtn
+        CloseButton   = $closeBtn
+        LangButton    = $langBtn
+    }
+    Update-GuiText -Win $win -Ui $ui
+
+    $langBtn.Add_Click({
+        [void](Switch-UiLanguage)
+        Update-GuiText -Win $win -Ui $ui
+        Update-GuiStatus -Path $path -Block $status
+        Set-GuiMessage $msg '' '#0F6CBD'
+    }.GetNewClosure())
 
     $slider.Value = [double]([Math]::Max(0, [Math]::Min(100, $cur.Opacity)))
     $valueText.Text = "$([int]$slider.Value)%"
@@ -1139,10 +1490,11 @@ function Start-Gui {
             $a = [bool]$switch.IsChecked
             [void](Invoke-WithLock { Set-Skin -Path $path -Opacity $v -Acrylic $a })
             Update-GuiStatus -Path $path -Block $status
-            Set-GuiMessage $msg "已应用：不透明度 $v%，亚克力$(if ($a) { '开启' } else { '关闭' })。Terminal 会自动热重载。" '#0F6CBD'
+            $acrylicText = if ($a) { T 'on' } else { T 'off' }
+            Set-GuiMessage $msg (Tf 'gui_applied' @($v, $acrylicText)) '#0F6CBD'
         }
         catch {
-            Set-GuiMessage $msg ('应用失败：' + $_.Exception.Message) '#C42B1C'
+            Set-GuiMessage $msg (Tf 'gui_apply_failed' @($_.Exception.Message)) '#C42B1C'
         }
     }.GetNewClosure())
 
@@ -1153,10 +1505,10 @@ function Start-Gui {
             $slider.Value = [double]([Math]::Max(0, [Math]::Min(100, $c.Opacity)))
             $switch.IsChecked = $c.UseAcrylic
             Update-GuiStatus -Path $path -Block $status
-            Set-GuiMessage $msg '已还原到使用本工具之前的外观。' '#0F6CBD'
+            Set-GuiMessage $msg (T 'gui_reset_done') '#0F6CBD'
         }
         catch {
-            Set-GuiMessage $msg ('还原失败：' + $_.Exception.Message) '#C42B1C'
+            Set-GuiMessage $msg (Tf 'gui_reset_failed' @($_.Exception.Message)) '#C42B1C'
         }
     }.GetNewClosure())
 
@@ -1192,19 +1544,19 @@ try {
     if ($Repair) {
         $r = Invoke-WithLock { Repair-Defaults -Path $script:TargetPath }
         if ($r.Changed) {
-            Write-Host '已清理显式默认值（opacity=100 / useAcrylic=false）。' -ForegroundColor Green
-            Write-Host "备份：$($r.Backup)"
+            Write-Host (T 'repaired') -ForegroundColor Green
+            Write-Host (Tf 'backup_line' @($r.Backup))
         }
         else {
-            Write-Host '没有需要清理的显式默认值。'
+            Write-Host (T 'repair_none')
         }
         return
     }
 
     if ($Reset) {
         $backup = Invoke-WithLock { Undo-Skin -Path $script:TargetPath }
-        Write-Host "已还原到使用本工具之前的外观。" -ForegroundColor Green
-        Write-Host "还原前快照：$backup"
+        Write-Host (T 'restored') -ForegroundColor Green
+        Write-Host (Tf 'snapshot_before' @($backup))
         return
     }
 
@@ -1212,8 +1564,9 @@ try {
         $value = if ($Opacity -ge 0) { $Opacity } else { 85 }
         $useAcrylic = -not $DisableAcrylic -and $Acrylic
         $backup = Invoke-WithLock { Set-Skin -Path $script:TargetPath -Opacity $value -Acrylic $useAcrylic }
-        Write-Host "已应用：不透明度 $value%，亚克力 $(if ($useAcrylic) { '开启' } else { '关闭' })" -ForegroundColor Green
-        Write-Host "备份：$backup"
+        $acrylicText = if ($useAcrylic) { T 'on' } else { T 'off' }
+        Write-Host (Tf 'applied' @($value, $acrylicText)) -ForegroundColor Green
+        Write-Host (Tf 'backup_line' @($backup))
         return
     }
 
@@ -1221,13 +1574,13 @@ try {
 }
 catch {
     if ($consoleMode) {
-        Write-Host ('错误：' + $_.Exception.Message) -ForegroundColor Red
+        Write-Host (Tf 'error_prefix' @($_.Exception.Message)) -ForegroundColor Red
         exit 1
     }
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
     [void][System.Windows.Forms.MessageBox]::Show(
         $_.Exception.Message,
-        'TerminalGlass 出错',
+        (T 'error_title'),
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error)
 }
